@@ -1,0 +1,27 @@
+#!/usr/bin/perl -wn
+
+# the -n switch gives us a loop around the script. the BEGIN block is
+# only executed once. it sets up our prompt and turns off the signals
+# that could interrupt the script
+
+BEGIN {
+# turn off control keys
+    $SIG{$_} = 'IGNORE' for keys %SIG;   
+# let the user know how to get off this crazy thing.
+    print "\n\tType\e[1m exit\e[0m when you are ready to stop.\n";
+
+    $history = 1;
+    sub prompt {
+        print "\n", $ENV{USER}, '@perl-shell[', $history++, ']>';
+    }
+    prompt;
+}
+# the body is executed over and over (each time <> is given). all we
+# do is eval the body, and voila, perl-shell behavior
+
+eval;
+$@ and warn $@;  # give perl errors back to the user
+
+prompt;                # print a fresh prompt with updated history
+
+END { print "\n\t\tBye!\n\n" }

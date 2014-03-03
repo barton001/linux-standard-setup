@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+
+version = "1.4.1"
+
+"""
+lsf
+
+Standalone Python module which is intended to combine the features of the
+Unix commands 'ls' and 'find'.
+"""
+
+# History:
+# v1.3  05/18/99  Don't display directories with no matching files.
+# v1.4  09/03/99  Add option to exclude certain filetypes.
+#
+
+usage = """
+lsf v%s usage:   lsf [option-list] [path-list]
+
+Options:
+    -l           long listing
+    -R           recursively descend into subdirectories
+    -d           don't descend into directories given on command line
+    -h           print help message
+    -u user      list files owned by user (username or uid)
+    -g grp       list files owned by group (name or gid)
+    -t m|a|c     show modified, accessed, or created date (default: m) 
+    -m [+]n      list files modified in last n days
+    -a [+]n      list files accessed in last n days
+    -c [+]n      list files created in last n days
+    -s [+]size   list files smaller than size bytes (or bigger than +size)
+    -S [+]n|t|s  sort by name (default), time (date), or size
+    -e types     exclude file types, where types is one or more of
+                   [r]egular,[d]irectory,[c]har,[b]lock,[l]ink,[p]ipe,[s]ocket
+
+Notes:  Size may be followed by a letter indicating the unit
+            (one of b[locks],k[ilobytes],m[egabytes],g[igabytes])
+        Arguments to -m, -a, and -c options may be followed by a letter
+	    (one of m[inutes],h[ours],d[ays],w[eeks],y[ears])
+        Use -e +[types] to include only certain file types
+""" % version
+
+import os, grp, string, sys, stat, getopt, posix, time, pwd
+
+debug = 0
+
+users = {}
+groups = {}
+tclist = []	# list of file type codes to exclude
+totfiles = totsize = gtotfiles = gtotsize = 0L
+this_year = str(time.localtime(time.time())[0])
+RECURSIVE = 0
+DESCEND = 1	# descend into directories on command line
+long = 0	# default to short (names only) listing
+FILTER_VALUES = []
+date_field = 'm' # default is to display modified date
+sort_field = 'n' # default is to sort on name
+reverse_sort = 0
+
+#  Define names for the fields in statlist (see show_files)
+MODE = 0
+INODE = 1
+DEV = 2
+NLINK = 3
+UID = 4
+GID = 5
+SIZE = 6
+ATIME = 7
+MTIME = 8
+CTIME = 9
+FILE = 10
+
+#  Map IFMT field of mode to file type character
+#   (if we encounter a broken link, the statfile function returns mode=0)
+ftypes = {
+    0 : 'l',
+    stat.S_IFDIR : 'd',
+    stat.S_IFCHR : 'c',
+    stat.S_IFBLK : 'b',
+    stat.S_IFREG : '-',
+    stat.S_IFLNK : 'l',
+    stat.S_IFIFO : 'p',
+    stat.S_IFSOCK : 'S'
+}
+
+#  Map file type characters as specified in '-e' option to type codes
+c_to_ftype = {
+    'd' : stat.S_IFDIR,
+    'c' : stat.S_IFCHR,
+    'b' : stat.S_IFBLK,
+    'r' : stat.S_IFREG,
+    'l' : stat.S_IFLNK,
+    'p' : stat.S_IFIFO,
+    's' : stat.S_IFSOCK
+}
+
+def ltos(l):
+    "Convert a long integer to a string"
+    s = repr(l)
+    if s[-1] == 'L': s = s[:-1]
+    return s
+
+def add_filter(field, value):
+    global FILTER_VALUES
+    if field == "USER":
+        try:
+	    uid = pwd.getpwnam(value)[2]
+	except KeyError:
+	    uid = string.atoi(value)
+	FILTER_VALUES.append(['UID', `uid`, '=='])
+    elif field == "GROUP":
+        try:  # convert group name to number
+	    gid = grp.getgrnam(value)[2]
+	except KeyError:
+	    gid = string.atoi(value)
+	FILTER_VALUES.append(['GID', `gid`, '=='])
+    elif field in ["MTIME","ATIME","CTIME"]:
+	fieldnum = eval(field)
+	start_time = time.time() - day_to_secs(value)
+	if value[0] == '+':
+	    comparison = '<'
+	else:
+	    comparison = '>'
+	FILTER_VALUES.append([field, `start_time`, comparison])
+    elif field == "SIZE":
+	if value[0] == '+':
+	    comparison = '>'
+	else:
+	    comparison = '<'
+	size = size_from_string(value)
+	FILTER_VALUES.append(['SIZE', `size`, comparison])
+
+
+def size_from_string(s):
+    "Convert size from string to integer (e.g. '10k' ==> 10240)"
+    number = string.digits + '+'
+    size = modifier = ""
+    for char in s:
+	if char in number:
+	    size = size + char
+	else:
+	    modifier = modifier + char
+    size = string.atoi(size)
+    if modifier:
+	modifier = string.lower(modifier[0])
+	if   modifier == 'b':  size = size * 512
+	elif modifier == 'k':  size = size * 1024
+	elif modifier == 'm':  size = size * 1024 * 1024
+	elif modifier == 'g':  size = size * 1024 * 1024 * 1024
+    return size
+
+
+def day_to_secs(s):
+    "Convert time interval from string to integer seconds (e.g. '10h' ==> 10 hours)"
+    number = string.digits + '+'
+    secs = modifier = ""
+    for char in s:
+	if char in number:
+	    secs = secs + char
+	else:
+	    modifier = modifier + char
+    secs = string.atoi(secs)
+    if not modifier: modifier = 'd'
+    modifier = string.lower(modifier[0])
+    if   modifier == 'm':  secs = secs * 60
+    elif modifier == 'h':  secs = secs * 60 * 60
+    elif modifier == 'd':  secs = secs * 60 * 60 * 24
+    elif modifier == 'w':  secs = secs * 60 * 60 * 24 * 7
+    elif modifier == 'y':  secs = secs * 60 * 60 * 24 * 365
+    return secs
+
+def set_date_field(value):
+    global date_field
+    v = string.lower(value[0])
+    if v in 'vca':
+	date_field = v
+    else:
+	date_field = 'm'
+
+def set_sort_field(value):
+    global sort_field, reverse_sort
+    if value[0] == '+':
+	reverse_sort = 1
+	value = value[1:]
+    v = string.lower(value[0])
+    if v in 'stn':
+	sort_field = v
+    else:
+	sort_field = 'n'
+
+def filters(statlist):
+    result = 1
+    for field, value, comparison in FILTER_VALUES:
+        if debug: print "filter:", field, value, comparison
+	command = "newresult = statlist["+field+"] "+comparison+value
+	if debug: print "Executing filter command:", command
+        exec(command)
+	result = result and newresult
+    # Apply typecode filter to remove excluded file types
+    if tclist:
+	ifmt = stat.S_IFMT(statlist[MODE])	# get IFMT bits
+	if ifmt in tclist: 
+	    result = 0
+	    if debug: print "Excluded file based on type (%d)." % ifmt
+	else:
+	    if debug: print "File type OK (%d)." % ifmt
+    return result
+    
+    
+def user_from_id(uid):
+    try:
+	return pwd.getpwuid(uid)[0]
+    except KeyError:
+	return str(uid)
+
+
+def group_from_id(gid):
+    try:
+	return grp.getgrgid(gid)[0]
+    except KeyError:
+	return str(gid)
+
+
+def mode_to_string(mode):
+    ifmt = stat.S_IFMT(mode)	# get IFMT bits
+    mstring = ftypes[ifmt]	# start of mode string with file type
+    mask = 0400
+    chars = 'rwxrwxrwx'
+    i = 0
+    while mask:
+        if (mode & mask):
+            mstring = mstring + chars[i]
+	else:
+	    mstring = mstring + '-'
+	i = i + 1
+	mask = mask >> 1
+    return mstring
+
+def statfile(file):
+    try:
+        return os.stat(file)
+    except posix.error, reason:
+        if os.path.islink(file):
+	    if long: print "Broken link:", file
+            return (0,0,0,0,0,0,0,0,0,0)
+	else:
+	    print "Cannot stat file", file, ": ", reason
+        print "Unable to continue."
+	sys.exit(1)
+		
+def show_files(files, path = ""):
+    global users, groups, gtotsize, gtotfiles, totsize, totfiles, sort_field
+    #  Add path to file list
+    if path:
+        files = map(lambda file, path = path: path + os.sep + file, files)
+    #  Get list of file info
+    statlist = map(lambda x,y: x + (y,), map(statfile, files), files)
+
+    #
+    #  Now apply any filters
+    #
+    statlist = filter(filters, statlist)
+    
+    #
+    #  Now sort by desired field
+    #
+    if sort_field == 't':  sort_field = date_field
+    n = (6,7,8,9,10)[string.index("samcn",sort_field)]
+    newlist = map(lambda x, n=n: (x[n],) + x, statlist) # add field to front of list
+    newlist.sort()
+    if reverse_sort: newlist.reverse()
+    statlist = map(lambda x: x[1:], newlist)	# remove 1st field
+
+    totsize = reduce(lambda x,y: x+y[6], statlist, 0L)
+    totfiles = len(statlist)
+    if RECURSIVE:
+        subdirectories = filter(os.path.isdir, files)
+    else:
+        subdirectories = []
+
+    if long and statlist: print "\nDirectory %s\n" % path
+
+    for stats in statlist:
+        mode,inode,dev,nlink,uid,gid,size,atime,mtime,ctime, file = stats
+	path = os.path.dirname(file)
+	filename = os.path.basename(file)
+	user = user_from_id(uid)
+	group = group_from_id(gid)
+	if date_field == 'm':
+	    date = mtime
+	elif date_field == 'a':
+	    date = atime
+	elif date_field == 'c':
+	    date = ctime
+        date = time.ctime(date)
+        [wday,month,day,timeofday,year] = string.split(date)
+        if year != this_year:
+            date = "%3s %2s %5s" % (month,day,year)
+        else:
+            date = "%3s %2s %5s" % (month,day,timeofday[:5])
+        mode = mode_to_string(mode)
+        if os.path.islink(file):
+            mode = 'l' + mode[1:]
+	if long:
+            print "%s %4d %-8s %-8s %10d %-12s %s" % \
+                (mode,nlink,user,group,size,date,filename)
+	else:
+	    print file
+    if long and statlist:
+        print "\nTotal of %s files, %s bytes (%0.2f Mbytes)" % \
+	      (totfiles, ltos(totsize), totsize/(1024.0*1024.0))
+    gtotfiles = gtotfiles + totfiles
+    gtotsize = gtotsize + totsize
+    return subdirectories
+    
+def show_directory(path):
+    try:
+        files = os.listdir(path)
+    except posix.error, reason:
+        print "Unable to access ", path + ':', reason[1]
+	sys.exit(reason[0])
+    if not files:
+        return
+    subdirectories = show_files(files, path)
+    if subdirectories:
+        for directory in subdirectories:
+	    show_directory(directory)
+    return
+
+def file_types(tlist):
+    global tclist
+    if tlist[0] == "+":
+	include = 1
+	tlist = tlist[1:]
+    else:
+	include = 0
+    for c in tlist:
+	if c not in "rdcblps":
+	    print "Unknown file type character (%c) for -e option." % c
+	    sys.exit(1)
+    if include:
+	x = ""
+	for c in "rdcblps":
+	    if c not in tlist:
+		x = x + c
+	tlist = x
+    # Map type characters into list of type codes to exclude
+    for c in tlist:
+	tclist.append(c_to_ftype[c])
+	if c == 'l': tclist.append(0) # add typecode for broken link
+    if debug: print "Type codes to exclude =", tclist
+
+def main():
+    global RECURSIVE, DESCEND, debug, long
+    try:
+        optlist, args = getopt.getopt(sys.argv[1:], 'lDRdhS:t:u:g:m:a:c:s:e:')
+    except getopt.error, msg:
+        print sys.argv[0], "error:", msg
+	print usage
+	sys.exit(1)
+    ft = ""
+    for opt in optlist:
+        if opt[0] == '-R':  RECURSIVE = 1
+        if opt[0] == '-d':  DESCEND = 0
+        if opt[0] == '-D':  debug = 1
+        if opt[0] == '-l':  long = 1
+	if opt[0] == '-t':  set_date_field(opt[1])
+	if opt[0] == '-S':  set_sort_field(opt[1])
+        if opt[0] == '-u':  add_filter("USER", opt[1])
+        if opt[0] == '-g':  add_filter("GROUP", opt[1])
+        if opt[0] == '-m':  add_filter("MTIME", opt[1])
+        if opt[0] == '-a':  add_filter("ATIME", opt[1])
+        if opt[0] == '-c':  add_filter("CTIME", opt[1])
+        if opt[0] == '-s':  add_filter("SIZE", opt[1])
+	if opt[0] == '-e':  ft = opt[1]
+	if opt[0] == '-h':
+	    print usage
+	    sys.exit(0)
+	if ft: file_types(ft)	# set which file types to exclude
+    
+    if args:
+        paths = args
+    else:
+        paths = os.curdir
+    files = []
+    for path in paths:
+        if os.path.isdir(path) and DESCEND:
+            show_directory(path)
+        else:
+	    files.append(path)
+    if files:
+	subdirs = show_files(files)
+    if (totfiles != gtotfiles) and long:
+        print "\n Grand total of %s files, %s bytes (%0.2f Mbytes)" % \
+            (ltos(gtotfiles), ltos(gtotsize), gtotsize/(1024.0*1024.0))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(1)
